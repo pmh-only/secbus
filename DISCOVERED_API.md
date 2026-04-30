@@ -31,3 +31,15 @@ get bus station list
 
 need authentication
 change RM_IDX only
+
+---
+
+GET https://samsung.u-vis.com/mobile/RouteAction.do?method=RouteCarLocation&RM_IDX=32878
+
+get live bus locations for a route
+
+need authentication
+change RM_IDX only
+
+BI_X_POSITION is latitude
+BI_Y_POSITION is longitude

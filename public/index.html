@@ -96,10 +96,35 @@ async function loadStations(rmIdx) {
   return out;
 }
 
+async function loadBuses(rmIdx) {
+  const r = await fetch(`/api/buses?rm_idx=${encodeURIComponent(rmIdx)}`).then(r => r.json());
+  return (r.dataList || [])
+    .map(b => ({
+      lat: parseFloat(b.BI_X_POSITION),
+      lng: parseFloat(b.BI_Y_POSITION),
+      carNumber: b.AI_CM_NUMBER || '',
+      driverName: b.AI_DRI_NAME || '',
+      driverPhone: b.AI_DRI_CEL || '',
+      runStatus: b.RunStatus || b.CODENAME || '',
+      statusName: b.CODENAME || '',
+      time: b.BI_TIME || '',
+      rentalName: b.AI_RENT_NAME || '',
+      pax: b.Pax || '',
+      paxCapacity: b.PaxCapacity || '',
+    }))
+    .filter(b => Number.isFinite(b.lat) && Number.isFinite(b.lng));
+}
+
 function fmtMin(m) {
   if (!m) return '출발';
   const h = Math.floor(m / 60), mm = m % 60;
   return h ? `+${h}h${mm}m` : `+${mm}m`;
+}
+
+function fmtTime(t) {
+  const s = String(t || '').padStart(6, '0');
+  if (!/^\d{6}$/.test(s)) return t || '';
+  return `${s.slice(0, 2)}:${s.slice(2, 4)}:${s.slice(4, 6)}`;
 }
 
 function haversineKm(a, b) {
@@ -112,7 +137,7 @@ function haversineKm(a, b) {
   return 2 * R * Math.asin(Math.sqrt(s));
 }
 
-function drawRoute(route, color, data) {
+function drawRoute(route, color, data, buses) {
   clearRoute(route.rmIdx);
   const group = L.layerGroup();
   const line = data.track.length > 1
@@ -139,6 +164,24 @@ function drawRoute(route, color, data) {
     .bindPopup(`<b>${route.name}</b><br>${s.order}. ${s.name}<br><span class="meta">${fmtMin(s.arrMin)} · ${route.start}→${route.end}</span>`)
     .addTo(group);
   });
+  buses.forEach((bus, i) => {
+    L.circleMarker([bus.lat, bus.lng], {
+      radius: 8,
+      color: '#111',
+      weight: 2,
+      fillColor: color,
+      fillOpacity: 1,
+    })
+    .bindTooltip(`${route.name} bus ${i + 1}`, { direction: 'top' })
+    .bindPopup(
+      `<b>${route.name}</b><br>` +
+      `${bus.carNumber || `bus ${i + 1}`}<br>` +
+      `<span class="meta">${bus.statusName || bus.runStatus}${bus.time ? ` · ${fmtTime(bus.time)}` : ''}</span><br>` +
+      `<span class="meta">${bus.driverName || '-'} ${bus.driverPhone || ''}</span><br>` +
+      `<span class="meta">${bus.rentalName || ''}${bus.paxCapacity ? ` · ${bus.pax}/${bus.paxCapacity}` : ''}</span>`
+    )
+    .addTo(group);
+  });
   group.addTo(map);
   layers.set(route.rmIdx, group);
   return data.track.length ? data.track : data.stations.map(s => [s.lat, s.lng]);
@@ -157,11 +200,11 @@ function clearAll() {
 async function toggleRoute(route, idx) {
   if (layers.has(route.rmIdx)) { clearRoute(route.rmIdx); return; }
   statusEl.textContent = `loading ${route.name}…`;
-  const data = await loadStations(route.rmIdx);
-  const pts = drawRoute(route, colorFor(idx), data);
+  const [data, buses] = await Promise.all([loadStations(route.rmIdx), loadBuses(route.rmIdx)]);
+  const pts = drawRoute(route, colorFor(idx), data, buses);
   document.querySelector(`[data-rm="${route.rmIdx}"]`)?.classList.add('active');
   if (pts.length) map.fitBounds(pts, { padding: [30, 30] });
-  statusEl.textContent = `${route.name} — ${data.stations.length} stops, ${data.track.length} track points`;
+  statusEl.textContent = `${route.name} — ${data.stations.length} stops, ${data.track.length} track points, ${buses.length} buses`;
 }
 
 function renderList() {
@@ -214,8 +257,8 @@ async function showAll() {
     while (queue.length) {
       const { rt, idx } = queue.shift();
       try {
-        const data = await loadStations(rt.rmIdx);
-        const pts = drawRoute(rt, colorFor(idx), data);
+        const [data, buses] = await Promise.all([loadStations(rt.rmIdx), loadBuses(rt.rmIdx)]);
+        const pts = drawRoute(rt, colorFor(idx), data, buses);
         document.querySelector(`[data-rm="${rt.rmIdx}"]`)?.classList.add('active');
         pts.forEach(p => all.push(p));
       } catch (e) { console.warn(rt.rmIdx, e); }

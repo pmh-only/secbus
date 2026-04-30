@@ -77,6 +77,13 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(r.status, { 'Content-Type': 'application/json; charset=utf-8' });
       return res.end(r.body);
     }
+    if (u.pathname === '/api/buses') {
+      await ensureLogin();
+      const rmIdx = u.searchParams.get('rm_idx');
+      const r = await upstream(`/mobile/RouteAction.do?method=RouteCarLocation&RM_IDX=${encodeURIComponent(rmIdx)}`);
+      res.writeHead(r.status, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(r.body);
+    }
     let filePath = u.pathname === '/' ? '/index.html' : u.pathname;
     const full = path.join(__dirname, 'public', filePath);
     if (!full.startsWith(path.join(__dirname, 'public'))) { res.writeHead(403); return res.end(); }
