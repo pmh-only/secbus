@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>secbus route map</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+  #app { display: grid; grid-template-columns: 360px 1fr; height: 100%; }
+  #side { border-right: 1px solid #ddd; overflow: auto; padding: 12px; }
+  #map { height: 100%; background: #111; }
+  .row { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; }
+  .row input, .row select, .row button { padding: 6px; font-size: 13px; }
+  .row input[type=search] { flex: 1; min-width: 120px; }
+  .route { padding: 6px 8px; border-radius: 6px; cursor: pointer; margin: 2px 0; border: 1px solid transparent; font-size: 13px; }
+  .route:hover { background: #f2f6ff; }
+  .route.active { background: #e4ecff; border-color: #7aa0ff; }
+  .route small { color: #888; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  #status { font-size: 12px; color: #666; margin: 6px 0; white-space: pre-wrap; }
+  h3 { margin: 10px 0 6px; font-size: 13px; color: #333; }
+  .meta { color: #666; font-size: 11px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <div class="row">
+      <label>site</label>
+      <select id="cust" style="flex:1"></select>
+    </div>
+    <div class="row">
+      <label>방향</label>
+      <select id="rm"><option value="1">1 출근</option><option value="2">2 퇴근</option></select>
+      <button id="load">load</button>
+      <button id="showAll">show all</button>
+      <button id="clear">clear</button>
+    </div>
+    <div class="row">
+      <input type="search" id="filter" placeholder="filter by name/area…" />
+    </div>
+    <div id="status"></div>
+    <h3>routes (<span id="count">0</span>)</h3>
+    <div id="routes"></div>
+  </div>
+  <div id="map"></div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map').setView([37.25, 127.1], 9);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OSM' }).addTo(map);
+map.getPane('tilePane').style.filter = 'brightness(0.55) contrast(1.1)';
+
+const statusEl = document.getElementById('status');
+const routesEl = document.getElementById('routes');
+const countEl = document.getElementById('count');
+const filterEl = document.getElementById('filter');
+const custSel = document.getElementById('cust');
+
+const layers = new Map();      // rm_idx -> L.layerGroup
+const cache = new Map();       // rm_idx -> { track:[[lat,lng]], stations:[{lat,lng,name,order,arrMin}] }
+let routeList = [];
+
+const colorFor = i => `hsl(${(i * 47) % 360}, 70%, 45%)`;
+
+async function loadSites() {
+  const r = await fetch('/api/sites').then(r => r.json());
+  const list = r.dataList || [];
+  custSel.innerHTML = list.map(s =>
+    `<option value="${s.CODE_VAL}"${s.CODE_VAL === 'CI130708000011' ? ' selected' : ''}>${s.CODE_NAME}</option>`
+  ).join('');
+}
+
+async function loadStations(rmIdx) {
+  if (cache.has(rmIdx)) return cache.get(rmIdx);
+  const r = await fetch(`/api/stations?rm_idx=${encodeURIComponent(rmIdx)}`).then(r => r.json());
+  const track = (r.dataRealRouteList || [])
+    .slice()
+    .sort((a, b) => (+a.RR_ORDER) - (+b.RR_ORDER))
+    .map(p => [parseFloat(p.RR_LATITUDE), parseFloat(p.RR_LONGITUDE)])
+    .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b));
+  const stations = (r.dataStationList || [])
+    .slice()
+    .sort((a, b) => (+a.RD_ORDER) - (+b.RD_ORDER))
+    .map(s => ({
+      lat: parseFloat(s.SI_LATITUDE),
+      lng: parseFloat(s.SI_LONGITUDE),
+      name: s.SI_NAME || '',
+      order: +s.RD_ORDER,
+      arrMin: +s.RD_ARR_TIME || 0,
+    }))
+    .filter(s => Number.isFinite(s.lat) && Number.isFinite(s.lng));
+  const out = { track, stations };
+  cache.set(rmIdx, out);
+  return out;
+}
+
+function fmtMin(m) {
+  if (!m) return '출발';
+  const h = Math.floor(m / 60), mm = m % 60;
+  return h ? `+${h}h${mm}m` : `+${mm}m`;
+}
+
+function haversineKm(a, b) {
+  const R = 6371;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(b[0] - a[0]);
+  const dLng = toRad(b[1] - a[1]);
+  const s = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a[0])) * Math.cos(toRad(b[0])) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+function drawRoute(route, color, data) {
+  clearRoute(route.rmIdx);
+  const group = L.layerGroup();
+  const line = data.track.length > 1
+    ? data.track
+    : data.stations.map(s => [s.lat, s.lng]);
+  const isFallback = data.track.length < 2;
+  for (let i = 1; i < line.length; i++) {
+    const a = line[i - 1], b = line[i];
+    const far = haversineKm(a, b) > 10;
+    L.polyline([a, b], {
+      color,
+      weight: far ? 1 : (isFallback ? 2 : 4),
+      opacity: far ? 0.5 : 0.75,
+      dashArray: isFallback && !far ? '6,6' : null,
+    }).addTo(group);
+  }
+  data.stations.forEach((s, i) => {
+    const isEnd = i === 0 || i === data.stations.length - 1;
+    L.circleMarker([s.lat, s.lng], {
+      radius: isEnd ? 7 : 5,
+      color, fillColor: isEnd ? color : '#fff', fillOpacity: 1, weight: 2,
+    })
+    .bindTooltip(`${s.order}. ${s.name}`, { direction: 'top' })
+    .bindPopup(`<b>${route.name}</b><br>${s.order}. ${s.name}<br><span class="meta">${fmtMin(s.arrMin)} · ${route.start}→${route.end}</span>`)
+    .addTo(group);
+  });
+  group.addTo(map);
+  layers.set(route.rmIdx, group);
+  return data.track.length ? data.track : data.stations.map(s => [s.lat, s.lng]);
+}
+
+function clearRoute(rmIdx) {
+  const g = layers.get(rmIdx);
+  if (g) { map.removeLayer(g); layers.delete(rmIdx); }
+  document.querySelector(`[data-rm="${rmIdx}"]`)?.classList.remove('active');
+}
+
+function clearAll() {
+  for (const [k] of layers) clearRoute(k);
+}
+
+async function toggleRoute(route, idx) {
+  if (layers.has(route.rmIdx)) { clearRoute(route.rmIdx); return; }
+  statusEl.textContent = `loading ${route.name}…`;
+  const data = await loadStations(route.rmIdx);
+  const pts = drawRoute(route, colorFor(idx), data);
+  document.querySelector(`[data-rm="${route.rmIdx}"]`)?.classList.add('active');
+  if (pts.length) map.fitBounds(pts, { padding: [30, 30] });
+  statusEl.textContent = `${route.name} — ${data.stations.length} stops, ${data.track.length} track points`;
+}
+
+function renderList() {
+  const q = filterEl.value.trim().toLowerCase();
+  const items = routeList
+    .map((rt, i) => ({ rt, i }))
+    .filter(({ rt }) => !q || rt.name.toLowerCase().includes(q) || (rt.area || '').toLowerCase().includes(q));
+  countEl.textContent = `${items.length}/${routeList.length}`;
+  routesEl.innerHTML = '';
+  for (const { rt, i } of items) {
+    const div = document.createElement('div');
+    div.className = 'route' + (layers.has(rt.rmIdx) ? ' active' : '');
+    div.dataset.rm = rt.rmIdx;
+    div.innerHTML =
+      `<span class="swatch" style="background:${colorFor(i)}"></span>` +
+      `${rt.name}<br><small>${rt.area || ''} · ${rt.start}→${rt.end} · #${rt.rmIdx}</small>`;
+    div.onclick = () => toggleRoute(rt, i);
+    routesEl.appendChild(div);
+  }
+}
+
+async function loadRoutes() {
+  statusEl.textContent = 'loading routes…';
+  clearAll();
+  cache.clear();
+  const cust = custSel.value;
+  const rm = document.getElementById('rm').value;
+  const r = await fetch(`/api/routes?cust=${encodeURIComponent(cust)}&rm=${rm}`).then(r => r.json());
+  routeList = (r.dataList || []).map(x => ({
+    rmIdx: x.RM_IDX,
+    name: x.RM_NAME || '(이름 없음)',
+    area: x.AREA_NAME || '',
+    start: x.RT_START || '',
+    end: x.RT_END || '',
+    stopover: x.RM_STOPOVER || '',
+  }));
+  statusEl.textContent = `${routeList.length} routes`;
+  renderList();
+}
+
+async function showAll() {
+  const visible = routeList.filter(rt => {
+    const q = filterEl.value.trim().toLowerCase();
+    return !q || rt.name.toLowerCase().includes(q) || (rt.area || '').toLowerCase().includes(q);
+  });
+  const all = [];
+  const CONCURRENCY = 6;
+  let done = 0;
+  async function worker(queue) {
+    while (queue.length) {
+      const { rt, idx } = queue.shift();
+      try {
+        const data = await loadStations(rt.rmIdx);
+        const pts = drawRoute(rt, colorFor(idx), data);
+        document.querySelector(`[data-rm="${rt.rmIdx}"]`)?.classList.add('active');
+        pts.forEach(p => all.push(p));
+      } catch (e) { console.warn(rt.rmIdx, e); }
+      done++;
+      statusEl.textContent = `loaded ${done}/${visible.length}`;
+    }
+  }
+  const queue = visible.map((rt) => ({ rt, idx: routeList.indexOf(rt) }));
+  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker(queue)));
+  if (all.length) map.fitBounds(all, { padding: [30, 30] });
+  statusEl.textContent = `done — ${visible.length} routes drawn`;
+}
+
+document.getElementById('load').onclick = loadRoutes;
+document.getElementById('showAll').onclick = showAll;
+document.getElementById('clear').onclick = clearAll;
+filterEl.addEventListener('input', renderList);
+custSel.addEventListener('change', loadRoutes);
+
+(async () => { await loadSites(); await loadRoutes(); })();
+</script>
+</body>
+</html>
